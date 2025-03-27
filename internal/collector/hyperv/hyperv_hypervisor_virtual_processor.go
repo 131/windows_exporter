@@ -1,24 +1,11 @@
-// Copyright 2024 The Prometheus Authors
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-//go:build windows
-
 package hyperv
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
+	"github.com/docker/docker/client"
 	"github.com/prometheus-community/windows_exporter/internal/pdh"
 	"github.com/prometheus-community/windows_exporter/internal/types"
 	"github.com/prometheus/client_golang/prometheus"
@@ -29,12 +16,11 @@ type collectorHypervisorVirtualProcessor struct {
 	perfDataCollectorHypervisorVirtualProcessor *pdh.Collector
 	perfDataObjectHypervisorVirtualProcessor    []perfDataCounterValuesHypervisorVirtualProcessor
 
-	// \Hyper-V Hypervisor Virtual Processor(*)\% Guest Run Time
-	// \Hyper-V Hypervisor Virtual Processor(*)\% Hypervisor Run Time
-	// \Hyper-V Hypervisor Virtual Processor(*)\% Remote Run Time
 	hypervisorVirtualProcessorTimeTotal         *prometheus.Desc
-	hypervisorVirtualProcessorTotalRunTimeTotal *prometheus.Desc // \Hyper-V Hypervisor Virtual Processor(*)\% Total Run Time
-	hypervisorVirtualProcessorContextSwitches   *prometheus.Desc // \Hyper-V Hypervisor Virtual Processor(*)\CPU Wait Time Per Dispatch
+	hypervisorVirtualProcessorTotalRunTimeTotal *prometheus.Desc
+	hypervisorVirtualProcessorContextSwitches   *prometheus.Desc
+
+	dockerClient *client.Client
 }
 
 type perfDataCounterValuesHypervisorVirtualProcessor struct {
@@ -58,21 +44,26 @@ func (c *Collector) buildHypervisorVirtualProcessor() error {
 	c.hypervisorVirtualProcessorTimeTotal = prometheus.NewDesc(
 		prometheus.BuildFQName(types.Namespace, Name, "hypervisor_virtual_processor_time_total"),
 		"Time that processor spent in different modes (hypervisor, guest_run, guest_idle, remote)",
-		[]string{"vm", "core", "state"},
+		[]string{"vm", "core", "state", "container_name", "image_name"},
 		nil,
 	)
 	c.hypervisorVirtualProcessorTotalRunTimeTotal = prometheus.NewDesc(
 		prometheus.BuildFQName(types.Namespace, Name, "hypervisor_virtual_processor_total_run_time_total"),
 		"Time that processor spent",
-		[]string{"vm", "core"},
+		[]string{"vm", "core", "container_name", "image_name"},
 		nil,
 	)
 	c.hypervisorVirtualProcessorContextSwitches = prometheus.NewDesc(
 		prometheus.BuildFQName(types.Namespace, Name, "hypervisor_virtual_processor_cpu_wait_time_per_dispatch_total"),
 		"The average time (in nanoseconds) spent waiting for a virtual processor to be dispatched onto a logical processor.",
-		[]string{"vm", "core"},
+		[]string{"vm", "core", "container_name", "image_name"},
 		nil,
 	)
+
+	c.dockerClient, err = client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return fmt.Errorf("failed to initialize Docker client: %w", err)
+	}
 
 	return nil
 }
@@ -84,7 +75,6 @@ func (c *Collector) collectHypervisorVirtualProcessor(ch chan<- prometheus.Metri
 	}
 
 	for _, data := range c.perfDataObjectHypervisorVirtualProcessor {
-		// The name format is <VM Name>:Hv VP <vcore id>
 		parts := strings.Split(data.Name, ":")
 		if len(parts) != 2 {
 			return fmt.Errorf("unexpected format of Name in Hyper-V Hypervisor Virtual Processor: %q, expected %q", data.Name, "<VM Name>:Hv VP <vcore id>")
@@ -98,41 +88,47 @@ func (c *Collector) collectHypervisorVirtualProcessor(ch chan<- prometheus.Metri
 		vmName := parts[0]
 		coreID := coreParts[2]
 
-		ch <- prometheus.MustNewConstMetric(
-			c.hypervisorVirtualProcessorTimeTotal,
-			prometheus.CounterValue,
-			data.HypervisorVirtualProcessorHypervisorRunTimePercent,
-			vmName, coreID, "hypervisor",
-		)
+		// Retrieve Docker container information
+		containerName, imageName := c.getContainerInfo(context.Background(), vmName)
 
-		ch <- prometheus.MustNewConstMetric(
-			c.hypervisorVirtualProcessorTimeTotal,
-			prometheus.CounterValue,
-			data.HypervisorVirtualProcessorGuestRunTimePercent,
-			vmName, coreID, "guest",
-		)
+		states := map[string]float64{
+			"hypervisor": data.HypervisorVirtualProcessorHypervisorRunTimePercent,
+			"guest":      data.HypervisorVirtualProcessorGuestRunTimePercent,
+			"remote":     data.HypervisorVirtualProcessorRemoteRunTimePercent,
+		}
 
-		ch <- prometheus.MustNewConstMetric(
-			c.hypervisorVirtualProcessorTimeTotal,
-			prometheus.CounterValue,
-			data.HypervisorVirtualProcessorRemoteRunTimePercent,
-			vmName, coreID, "remote",
-		)
+		for state, value := range states {
+			ch <- prometheus.MustNewConstMetric(
+				c.hypervisorVirtualProcessorTimeTotal,
+				prometheus.CounterValue,
+				value,
+				vmName, coreID, state, containerName, imageName,
+			)
+		}
 
 		ch <- prometheus.MustNewConstMetric(
 			c.hypervisorVirtualProcessorTotalRunTimeTotal,
 			prometheus.CounterValue,
 			data.HypervisorVirtualProcessorTotalRunTimePercent,
-			vmName, coreID,
+			vmName, coreID, containerName, imageName,
 		)
 
 		ch <- prometheus.MustNewConstMetric(
 			c.hypervisorVirtualProcessorContextSwitches,
 			prometheus.CounterValue,
 			data.HypervisorVirtualProcessorCPUWaitTimePerDispatch,
-			vmName, coreID,
+			vmName, coreID, containerName, imageName,
 		)
 	}
 
 	return nil
+}
+
+func (c *Collector) getContainerInfo(ctx context.Context, containerID string) (string, string) {
+	containerJSON, err := c.dockerClient.ContainerInspect(ctx, containerID)
+	if err != nil {
+		return "unknown", "unknown"
+	}
+
+	return strings.TrimPrefix(containerJSON.Name, "/"), containerJSON.Config.Image
 }
